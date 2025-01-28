@@ -3,6 +3,10 @@
 Attempting to replicate the tensors logic in C. Since this does not have autograd, this is basically a numpy 1d array haha. Good exercise though. Will extend to Nd tensors as well. 
 
 ```
+gcc -shared -o libtensor.so -fPIC tensor_nd.c
+```
+
+```
 t = Tensor1d.range_init(20)
 print(t[3])
 t[-1] = 100.0
