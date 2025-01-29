@@ -33,7 +33,7 @@ Tensor1d* init_tensor(int size, int stride) {
         return NULL;
     }
 
-    tensor->view->storage->data = (float *)malloc(size * sizeof(float));
+    tensor->view->storage->data = (Value *)malloc(size * sizeof(Value));
     if (!tensor->view->storage->data) {
         fprintf(stderr, "Error: Memory allocation for data failed.\n");
         free(tensor->view->storage);
@@ -46,6 +46,13 @@ Tensor1d* init_tensor(int size, int stride) {
     tensor->view->shape = size;
     tensor->view->stride = stride;
 
+    for (int i = 0; i < size; i++) {
+        tensor->view->storage->data[i].grad = 0.0f;
+        tensor->view->storage->data[i]._backward = NULL;
+        tensor->view->storage->data[i].prev[0] = NULL;
+        tensor->view->storage->data[i].prev[1] = NULL;
+    }
+
     return tensor;
 }
 
@@ -56,12 +63,12 @@ Tensor1d* tensor_arange(int upper_limit) {
     }
 
     for (int i = 0; i < upper_limit; i++) {
-        tensor->view->storage->data[i] = i;
+        tensor->view->storage->data[i].info = i;
+        tensor->view->storage->data[i].grad = 0;
     }
 
     return tensor;
 }
-
 
 Tensor1d* add_tensor_broadcast(Tensor1d *tensor, Tensor1d *small_tensor) {
     if (!verify_tensor(tensor) || !verify_tensor(small_tensor)) {
@@ -71,7 +78,6 @@ Tensor1d* add_tensor_broadcast(Tensor1d *tensor, Tensor1d *small_tensor) {
     int larger_size = tensor->view->shape;
     int smaller_size = small_tensor->view->shape;
 
-    // Ensure the smaller tensor can broadcast
     if (larger_size % smaller_size != 0) {
         fprintf(stderr, "Error: Broadcast size mismatch.\n");
         return NULL;
@@ -83,8 +89,9 @@ Tensor1d* add_tensor_broadcast(Tensor1d *tensor, Tensor1d *small_tensor) {
     }
 
     for (int i = 0; i < larger_size; i++) {
-        result->view->storage->data[i] = tensor->view->storage->data[i] +
-                                         small_tensor->view->storage->data[i % smaller_size];
+        result->view->storage->data[i].info = tensor->view->storage->data[i].info +
+                                               small_tensor->view->storage->data[i % smaller_size].info;
+        result->view->storage->data[i].grad = 0;
     }
 
     return result;
@@ -101,7 +108,25 @@ Tensor1d* tensor_scalar_add(Tensor1d *tensor, float scalar) {
     }
 
     for (int i = 0; i < tensor->view->shape; i++) {
-        result->view->storage->data[i] = tensor->view->storage->data[i] + scalar;
+        result->view->storage->data[i].info = tensor->view->storage->data[i].info + scalar;
+        result->view->storage->data[i].grad = 0;
+    }
+    return result;
+}
+
+Tensor1d* tensor_scalar_mul(Tensor1d *tensor, float scalar) {
+    if (!verify_tensor(tensor)) {
+        return NULL;
+    }
+
+    Tensor1d *result = init_tensor(tensor->view->shape, 1);
+    if (!result) {
+        return NULL;
+    }
+
+    for (int i = 0; i < tensor->view->shape; i++) {
+        result->view->storage->data[i].info = tensor->view->storage->data[i].info * scalar;
+        result->view->storage->data[i].grad = 0;
     }
     return result;
 }
@@ -114,12 +139,11 @@ void print_tensor(Tensor1d *tensor) {
 
     printf("Tensor (size: %d): [", tensor->view->shape);
     for (int i = 0; i < tensor->view->shape; i++) {
-        printf("%.2f", tensor->view->storage->data[i]);
+        printf("%.2f", tensor->view->storage->data[i].info);
         if (i < tensor->view->shape - 1) printf(", ");
     }
     printf("]\n");
 }
-
 
 bool verify_tensor(Tensor1d *tensor) {
     if (!tensor || !tensor->view || !tensor->view->storage || !tensor->view->storage->data) {
@@ -128,12 +152,12 @@ bool verify_tensor(Tensor1d *tensor) {
     return 1;
 }
 
-void append_data(Tensor1d *tensor, int new_value){
+void append_data(Tensor1d *tensor, int new_value) {
     if (!verify_tensor(tensor)) {
         return;
     }
     int new_size = tensor->view->shape + 1;
-    float *new_data = (float *)realloc(tensor->view->storage->data, new_size * sizeof(float));
+    Value *new_data = (Value *)realloc(tensor->view->storage->data, new_size * sizeof(Value));
 
     if (!new_data) {
         fprintf(stderr, "Error: Memory reallocation failed.\n");
@@ -141,11 +165,59 @@ void append_data(Tensor1d *tensor, int new_value){
     }
 
     tensor->view->storage->data = new_data;
-    tensor->view->storage->data[tensor->view->shape] = new_value;
+    tensor->view->storage->data[tensor->view->shape].info = new_value;
+    tensor->view->storage->data[tensor->view->shape].grad = 0;
     tensor->view->shape = new_size;
 }
 
-Tensor1d* add_tensor_to_tensor(Tensor1d *tensor, Tensor1d *tensor_){
+void backward_add(Tensor1d *tensor, Tensor1d *tensor_, int i, Tensor1d *result) {
+    tensor->view->storage->data[i].grad += result->view->storage->data[i].grad;
+    tensor_->view->storage->data[i].grad += result->view->storage->data[i].grad;
+}
+
+void backward_mul(Tensor1d *tensor, Tensor1d *tensor_, int i, Tensor1d *result) {
+    tensor->view->storage->data[i].grad += tensor_->view->storage->data[i].info * result->view->storage->data[i].grad;
+    tensor_->view->storage->data[i].grad += tensor->view->storage->data[i].info * result->view->storage->data[i].grad;
+}
+
+Tensor1d* get_grad(Tensor1d *tensor) {
+    if (!verify_tensor(tensor)) {
+        return NULL;
+    }
+    Tensor1d *grad = init_tensor(tensor->view->shape, 1);
+    if (!grad) {
+        return NULL;
+    }
+    for (int i = 0; i < tensor->view->shape; i++) {
+        grad->view->storage->data[i].info = tensor->view->storage->data[i].grad;
+    }
+    return grad;
+}
+
+void backward(Tensor1d *tensor, Tensor1d *tensor_, Tensor1d *result) {
+    for (int i = 0; i < tensor->view->shape; i++) {
+        if (tensor->view->storage->data[i]._backward) {
+            tensor->view->storage->data[i]._backward(tensor, tensor_, i, result);
+        }
+    }
+}
+
+void zero_grad(Tensor1d *tensor) {
+    if (!verify_tensor(tensor)) {
+        return;
+    }
+    for (int i = 0; i < tensor->view->shape; i++) {
+        tensor->view->storage->data[i].grad = 0.0f;
+    }
+}
+
+void add_grad(Tensor1d *tensor, int index, float grad) {
+    if (verify_tensor(tensor) && index < tensor->view->shape) {
+        tensor->view->storage->data[index].grad += grad;
+    }
+}
+
+Tensor1d* add_tensor_to_tensor(Tensor1d *tensor, Tensor1d *tensor_) {
     if (!verify_tensor(tensor) || !verify_tensor(tensor_)) {
         return NULL;
     }
@@ -158,80 +230,85 @@ Tensor1d* add_tensor_to_tensor(Tensor1d *tensor, Tensor1d *tensor_){
         return NULL;
     }
     for (int i = 0; i < tensor->view->shape; i++) {
-        result->view->storage->data[i] = tensor->view->storage->data[i] + tensor_->view->storage->data[i];
+        result->view->storage->data[i].info = tensor->view->storage->data[i].info + tensor_->view->storage->data[i].info;
+        result->view->storage->data[i].grad = 0;
+        result->view->storage->data[i]._backward = backward_add;
     }
     return result;
 }
 
-void set_item(Tensor1d *tensor, float item, int index){
-    // suppport negative index slicing
+Tensor1d* mul_tensor_to_tensor(Tensor1d *tensor, Tensor1d *tensor_) {
+    if (!verify_tensor(tensor) || !verify_tensor(tensor_)) {
+        return NULL;
+    }
+    if (tensor->view->shape != tensor_->view->shape) {
+        fprintf(stderr, "Error: Tensor shapes do not match.\n");
+        return NULL;
+    }
+    Tensor1d *result = init_tensor(tensor->view->shape, 1);
+    if (!result) {
+        return NULL;
+    }
+    for (int i = 0; i < tensor->view->shape; i++) {
+        result->view->storage->data[i].info = tensor->view->storage->data[i].info * tensor_->view->storage->data[i].info;
+        result->view->storage->data[i].grad = 0;
+
+        result->view->storage->data[i]._backward = backward_mul;
+    }
+    return result;
+}
+
+Tensor1d* tensor_sum(Tensor1d *tensor) {
+    if (!verify_tensor(tensor)) {
+        return NULL;
+    }
+    float sum = 0;
+    for (int i = 0; i < tensor->view->shape; i++) {
+        sum += tensor->view->storage->data[i].info;
+    }
+    Tensor1d *result = init_tensor(1, 1);
+    if (!result) {
+        return NULL;
+    }
+    result->view->storage->data[0].info = sum;
+    result->view->storage->data[0].grad = 0;
+    return result;
+}
+
+void set_item(Tensor1d *tensor, float item, int index) {
+    // support negative index slicing
     if (index < 0) { index = tensor->view->shape + index; }
 
-    // hamdle out of bounds values?
+    // handle out of bounds values?
     index = min(max(index, 0), tensor->view->shape);
 
     if (!verify_tensor(tensor)) {
-        // printf("Invalid tensor.\n");
         return;
     }
-    tensor->view->storage->data[index] = item;
+    tensor->view->storage->data[index].info = item;
+    tensor->view->storage->data[index].grad = 0;
 }
 
-int get_size(Tensor1d *tensor){
+int get_size(Tensor1d *tensor) {
     if (!verify_tensor(tensor)) {
         return -1;
     }
     return tensor->view->shape;
 }
 
-Tensor1d* get_item_as_tensor(Tensor1d *tensor, int index){
-    if (!verify_tensor(tensor)) {
-        return NULL;
-    }
-    float value = tensor->view->storage->data[index];
-    Tensor1d *tensor_ = init_tensor(1, 1);
-    
-    if (!tensor_) {
-        fprintf(stderr, "Error: Memory allocation for new tensor failed.\n");
-        return NULL;
-    }
-
-    tensor_->view->storage->data[0] = value;
-    return tensor_;
-}
-
-char* tensor_to_string(Tensor1d *tensor) {
-    if (!verify_tensor(tensor)) {
-        return NULL;
-    }
-    
-    int buf_size = 50 + tensor->view->shape * 15;
-    char *str = (char *)malloc(buf_size * sizeof(char));
-    
-    char *ptr = str;
-    ptr += sprintf(ptr, "Tensor (size: %d): [", tensor->view->shape);
-    for (int i = 0; i < tensor->view->shape; i++) {
-        if (i > 0) ptr += sprintf(ptr, ", ");
-        ptr += sprintf(ptr, "%.2f", tensor->view->storage->data[i]);
-    }
-    sprintf(ptr, "]");
-    return str;
-}
-
 void get_tensor_data(Tensor1d *tensor, float *buffer, int size) {
     if (!verify_tensor(tensor) || size < tensor->view->shape) return;
     
     for (int i = 0; i < tensor->view->shape; i++) {
-        buffer[i] = tensor->view->storage->data[i];
+        buffer[i] = tensor->view->storage->data[i].info;
     }
 }
-
 
 float get_item(Tensor1d *tensor, int index){
     if (!verify_tensor(tensor)) {
         return -1;
     }
-    return tensor->view->storage->data[index];
+    return tensor->view->storage->data[index].info;
 }
 
 Tensor1d* get_slice(Tensor1d *tensor, int start, int end, int stride) {
@@ -265,51 +342,57 @@ Tensor1d* get_slice(Tensor1d *tensor, int start, int end, int stride) {
     int idx = 0;
     for (int i = start; i < end; i += stride) {
         slice_tensor->view->storage->data[idx++] = tensor->view->storage->data[i];
+        slice_tensor->view->storage->data[idx].grad = tensor->view->storage->data[i].grad;
     }
 
     return slice_tensor;
 }
 
-void free_tensor(Tensor1d *tensor) {
+Tensor1d* get_item_as_tensor(Tensor1d *tensor, int index) {
     if (!verify_tensor(tensor)) {
-        return;
+        return NULL;
+    }
+    float value = tensor->view->storage->data[index].info;
+    Tensor1d *tensor_ = init_tensor(1, 1);
+
+    if (!tensor_) {
+        fprintf(stderr, "Error: Memory allocation for new tensor failed.\n");
+        return NULL;
     }
 
-    if (tensor->view) {
-        if (tensor->view->storage) {
-            free(tensor->view->storage->data);
-            free(tensor->view->storage);
-        }
-        free(tensor->view);
-    }
-    free(tensor);
+    tensor_->view->storage->data[0].info = value;
+    tensor_->view->storage->data[0].grad = 0;
+    return tensor_;
 }
 
-int main() {
-    Tensor1d *tensor = tensor_arange(10);
-    print_tensor(tensor);
+char* tensor_to_string(Tensor1d *tensor) {
+    if (!verify_tensor(tensor)) {
+        return NULL;
+    }
+    char *str = (char *)malloc(tensor->view->shape * 10 + 20);
+    if (!str) {
+        return NULL;
+    }
+    sprintf(str, "Tensor (size: %d): [", tensor->view->shape);
+    for (int i = 0; i < tensor->view->shape; i++) {
+        char buf[10];
+        sprintf(buf, "%.2f", tensor->view->storage->data[i].info);
+        strcat(str, buf);
+        if (i < tensor->view->shape - 1) {
+            strcat(str, ", ");
+        }
+    }
+    strcat(str, "]");
+    return str;
+}
 
-    Tensor1d *tensor_ = tensor_arange(5);
-    print_tensor(tensor_);
-
-    Tensor1d *result = add_tensor_broadcast(tensor, tensor_);
-    print_tensor(result);
-
-    Tensor1d *result_ = tensor_scalar_add(tensor, 5);
-    print_tensor(result_);
-
-    Tensor1d *slice = get_slice(tensor, 2, 8, 2);
-    print_tensor(slice);
-
-    char *str = tensor_to_string(tensor);
-    printf("%s\n", str);
-    free(str);
-
-    free_tensor(tensor);
-    free_tensor(tensor_);
-    free_tensor(result);
-    free_tensor(result_);
-    free_tensor(slice);
-
-    return 0;
+void free_tensor(Tensor1d *tensor) {
+    if (tensor) {
+        if (tensor->view && tensor->view->storage && tensor->view->storage->data) {
+            free(tensor->view->storage->data);
+        }
+        free(tensor->view->storage);
+        free(tensor->view);
+        free(tensor);
+    }
 }
